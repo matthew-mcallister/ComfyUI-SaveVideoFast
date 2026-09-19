@@ -1,9 +1,8 @@
 # SaveVideoFast node for ComfyUI
 
-A high performance video output node for [ComfyUI](https://github.com/comfyanonymous/ComfyUI) that encodes image sequences (batches of frames) into MP4 videos with optional audio. Optimised for speed, especially when processing frames generated on the GPU.
+A high performance video output node for [ComfyUI](https://github.com/comfyanonymous/ComfyUI) that encodes image sequences (batches of frames) into MP4 videos with optional audio. Optimised for speed, especially when processing frames generated on the GPU. It is designed as a nearly drop-in replacement for the default "Save Video" node.
 
 <img width="901" height="582" alt="speedup" src="https://github.com/user-attachments/assets/4ca61be1-eb50-4391-8bc3-30e0085f4bad" />
-
 
 ## Features
 
@@ -14,10 +13,11 @@ A high performance video output node for [ComfyUI](https://github.com/comfyanony
 - **Flexible quality settings** – supports CRF (libx264) and CQ (NVENC) for fine‑grained control.
 - **Configurable frame rate** and encoder preset.
 - **Built‑in web preview** – the generated video is displayed inside an HTML5 `<video>` tag in the ComfyUI interface, allowing you to play, open, or save it directly.
+- **Compatibility** – Follows the same behavior as the stock Save Video node, so you don't have to rewrite your workflows.
 
 ## Requirements
 
-- **ffmpeg** – must be installed and available in your system's `PATH`.  Guide: https://video.stackexchange.com/questions/20495/how-do-i-set-up-and-use-ffmpeg-in-windows
+- **ffmpeg** – must be installed and available in your system's `PATH`. Guide: https://video.stackexchange.com/questions/20495/how-do-i-set-up-and-use-ffmpeg-in-windows
 - ComfyUI (latest version recommended).
 
 ## Installation
@@ -36,24 +36,16 @@ The node will appear as "Save Video Fast" in the node menu.
 
 ## Usage
 
-Add the **SaveVideoFast** node to your workflow. Connect the `IMAGE` input (any source that outputs a batch of frames) and optionally an `AUDIO` input.
+Replace the Save Video node in your workflow with **SaveVideoFast**. Output container is always MP4,
+but otherwise this node should be a drop-in replacement.
 
-### Input Parameters
+### New Input Parameters
 
-| Parameter        | Type    | Description                                                                                                   |
-|------------------|---------|---------------------------------------------------------------------------------------------------------------|
-| `frames`         | `IMAGE` | **(required)** Batch of image tensors in [N, H, W, C] format (C=3, RGB).                                      |
-| `frame_rate`     | `INT`   | Frames per second. Default: `24`. Range: 1 – 120.                                                             |
-| `video_quality`  | `INT`   | Quality/bitrate control. Lower = better quality. <br>For `libx264`: CRF value (0–51, default 23).<br>For `h264_nvenc`: CQ value (0–51, default 23). |
-| `codec`          | `COMBO` | `h264_nvenc` (GPU, fastest) or `h264` (CPU, fallback). Default: `h264_nvenc`.                                 |
-| `preset`         | `COMBO` | NVENC preset: `p1` – `p7` (p1 fastest, p7 best quality). Only used when `codec` is `h264_nvenc`. Default: `p1`. |
-| `audio`          | `AUDIO` | **(optional)** Audio input (dict with `waveform` and `sample_rate`) from a ComfyUI audio node.                |
-
-### Output
-
-The node does **not** produce a tensor output. Instead, it:
-- Saves the final MP4 file to ComfyUI's `output/` directory.
-- Returns a UI preview that displays the video in an embedded HTML5 `<video>` tag, from which you can play, open in a new tab, or save it directly.
+| Parameter       | Type    | Description                                                                                                                                         |
+| --------------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `video_quality` | `INT`   | Quality/bitrate control. Lower = better quality. <br>For `libx264`: CRF value (0–51, default 23).<br>For `h264_nvenc`: CQ value (0–51, default 23). |
+| `codec`         | `COMBO` | `h264_nvenc` (GPU, fastest) or `h264` (CPU, fallback). Default: `h264_nvenc`.                                                                       |
+| `preset`        | `COMBO` | NVENC preset: `p1` – `p7` (p1 fastest, p7 best quality). Only used when `codec` is `h264_nvenc`. Default: `p1`.                                     |
 
 ## Performance Tips
 
@@ -64,12 +56,12 @@ The node does **not** produce a tensor output. Instead, it:
 
 ## Troubleshooting
 
-| Problem                                 | Solution                                                                               |
-|-----------------------------------------|----------------------------------------------------------------------------------------|
-| `ffmpeg` not found / error on start     | Ensure ffmpeg is installed and its binary is in your `PATH`. Check with `ffmpeg -version`. |
-| Encoding is still slow                  | Verify that `codec` is set to `h264_nvenc` and that your GPU supports NVENC.           |
-| Video has wrong length or is corrupted  | Check the frame count and that your `frame_rate` matches the intended duration.        |
-| Audio out of sync                       | Confirm that the audio sample rate and length are consistent with the video duration.  |
+| Problem                                | Solution                                                                                   |
+| -------------------------------------- | ------------------------------------------------------------------------------------------ |
+| `ffmpeg` not found / error on start    | Ensure ffmpeg is installed and its binary is in your `PATH`. Check with `ffmpeg -version`. |
+| Encoding is still slow                 | Verify that `codec` is set to `h264_nvenc` and that your GPU supports NVENC.               |
+| Video has wrong length or is corrupted | Check the frame count and that your `frame_rate` matches the intended duration.            |
+| Audio out of sync                      | Confirm that the audio sample rate and length are consistent with the video duration.      |
 
 ## Credits
 

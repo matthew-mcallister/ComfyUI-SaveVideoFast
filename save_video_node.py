@@ -1,69 +1,145 @@
+import json
 import os
 import subprocess
 import tempfile
-import time
+
 import numpy as np
 import torch
+
 import folder_paths
+from comfy.cli_args import args
+from comfy_api.latest import InputImpl, io, ui
+from comfy_extras.nodes_video import SaveVideo
 
-class SaveVideoFast:
+
+class SaveVideoFast(SaveVideo):
+    """Drop-in replacement for the core Save Video node that encodes with ffmpeg."""
+
     @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "frames": ("IMAGE", {"tooltip": "Input image batch (frames) to encode as video."}),
-                "frame_rate": ("INT", {
-                    "default": 24,
-                    "min": 1,
-                    "max": 120,
-                    "step": 1,
-                    "tooltip": "Frames per second. 24 is film standard, 30 for TV, 60 for smooth motion."
-                }),
-                "video_quality": ("INT", {
-                    "default": 23,
-                    "min": 2,
-                    "max": 31,
-                    "step": 1,
-                    "tooltip": "Lower = better quality (higher bitrate). 23 is a good balance. Range: 2 (near lossless) – 31 (very low)."
-                }),
-                "codec": (["h264_nvenc", "h264"], {
-                    "default": "h264_nvenc",
-                    "tooltip": "h264_nvenc uses NVIDIA GPU (fastest). h264 uses CPU (slower, but works without GPU)."
-                }),
-                "preset": (["p1", "p2", "p3", "p4", "p5", "p6", "p7"], {
-                    "default": "p1",
-                    "tooltip": "p1 = fastest encode (lowest quality). p7 = slowest (best quality). p1 is recommended for speed."
-                }),
-            },
-            "optional": {
-                "audio": ("AUDIO", {"tooltip": "Optional AUDIO input. If provided, it will be muxed into the MP4."}),
-            }
-        }
+    def define_schema(cls) -> io.Schema:
+        schema = super().define_schema()
+        schema.node_id = "SaveVideoFast"
+        schema.display_name = "Save Video Fast"
+        schema.description = (
+            "Saves the input video to your ComfyUI output directory using a fast "
+            "ffmpeg encode path. The running workflow is embedded in the MP4 metadata."
+        )
+        schema.inputs = [
+            io.Video.Input("video", tooltip="The video to save."),
+            io.String.Input(
+                "filename_prefix",
+                default="video/ComfyUI",
+                tooltip=(
+                    "The prefix for the file to save. This may include formatting information "
+                    "such as %date:yyyy-MM-dd% or %Empty Latent Image.width% to include values from nodes."
+                ),
+            ),
+            io.Combo.Input(
+                "codec",
+                options=["h264_nvenc", "h264"],
+                default="h264_nvenc",
+                tooltip="h264_nvenc uses NVIDIA GPU (fastest). h264 uses CPU (slower, but works without GPU).",
+            ),
+            io.Combo.Input(
+                "preset",
+                options=["p1", "p2", "p3", "p4", "p5", "p6", "p7"],
+                default="p1",
+                tooltip="p1 = fastest encode (lowest quality). p7 = slowest (best quality). p1 is recommended for speed.",
+            ),
+            io.Int.Input(
+                "video_quality",
+                default=23,
+                min=2,
+                max=31,
+                step=1,
+                tooltip="Lower = better quality (higher bitrate). 23 is a good balance. Range: 2 (near lossless) - 31 (very low).",
+            ),
+        ]
+        return schema
 
-    RETURN_TYPES = ()
-    RETURN_NAMES = ()
-    FUNCTION = "save_video"
-    OUTPUT_NODE = True
-    CATEGORY = "video"
+    @classmethod
+    def execute(cls, video, filename_prefix, codec, preset, video_quality) -> io.NodeOutput:
+        width, height = video.get_dimensions()
+        full_output_folder, filename, counter, subfolder, filename_prefix = folder_paths.get_save_image_path(
+            filename_prefix,
+            folder_paths.get_output_directory(),
+            width,
+            height,
+        )
+        file = f"{filename}_{counter:05}_.mp4"
+        out_path = os.path.join(full_output_folder, file)
 
-    def save_video(self, frames, frame_rate, video_quality, codec, preset, audio=None):
-        # ---------- 1. Validate frames ----------
+        metadata = {}
+        if not args.disable_metadata:
+            if cls.hidden.extra_pnginfo is not None:
+                metadata.update(cls.hidden.extra_pnginfo)
+            if cls.hidden.prompt is not None:
+                metadata["prompt"] = cls.hidden.prompt
+
+        if isinstance(video, InputImpl.VideoFromFile):
+            cls._encode_file(video, out_path, metadata)
+        else:
+            cls._encode_components(video.get_components(), out_path, codec, preset, video_quality, metadata)
+
+        return io.NodeOutput(
+            video,
+            ui=ui.PreviewVideo([ui.SavedResult(file, subfolder, io.FolderType.output)]),
+        )
+
+    @staticmethod
+    def _metadata_args(metadata):
+        cmd = []
+        for key, value in metadata.items():
+            cmd += ["-metadata", f"{key}={value if isinstance(value, str) else json.dumps(value)}"]
+        return cmd
+
+    @staticmethod
+    def _encoder_args(codec, preset, quality):
+        if codec == "h264_nvenc":
+            return ["-c:v", "h264_nvenc", "-preset", preset, "-cq", str(quality)]
+        return ["-c:v", "libx264", "-crf", str(quality)]
+
+    @classmethod
+    def _encode_file(cls, video, out_path, metadata):
+        source = video.get_stream_source()
+        temp_source = None
+        if not isinstance(source, (str, os.PathLike)):
+            temp_source = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+            temp_source.write(source.read())
+            temp_source.close()
+            source = temp_source.name
+
+        cmd = ["ffmpeg", "-y", "-loglevel", "quiet", "-i", os.fspath(source)]
+        cmd += ["-map", "0:v:0", "-map", "0:a?", "-c", "copy", "-map_metadata", "0"]
+        cmd += cls._metadata_args(metadata)
+        cmd += ["-movflags", "+faststart+use_metadata_tags", out_path]
+
+        try:
+            proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        finally:
+            if temp_source is not None:
+                try:
+                    os.unlink(temp_source.name)
+                except OSError:
+                    pass
+
+        if proc.returncode != 0:
+            raise RuntimeError(f"[SaveVideoFast] ffmpeg failed:\n{proc.stderr.decode(errors='replace')}")
+
+    @classmethod
+    def _encode_components(cls, components, out_path, codec, preset, quality, metadata):
+        frames = components.images
         if frames is None or len(frames) == 0:
-            print("[SaveVideoFast] No frames provided.")
-            return {"ui": {"gifs": []}}
+            raise ValueError("[SaveVideoFast] No frames provided.")
 
-        num_frames = len(frames)
         H, W = frames.shape[1], frames.shape[2]
+        frame_rate = float(components.frame_rate)
 
-        # ---------- 2. Prepare output path ----------
-        output_dir = folder_paths.get_output_directory()
-        timestamp = time.strftime("%Y%m%d_%H%M%S")
-        out_filename = f"video_{timestamp}.mp4"
-        out_path = os.path.join(output_dir, out_filename)
-
-        # ---------- 3. Handle audio (write to temp PCM) ----------
+        audio = components.audio
         audio_temp = None
-        audio_input_spec = None
+        cmd = ["ffmpeg", "-y", "-loglevel", "quiet"]
+        cmd += ["-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{W}x{H}", "-r", str(frame_rate), "-i", "pipe:0"]
+
         if audio is not None and "waveform" in audio and "sample_rate" in audio:
             waveform = audio["waveform"]
             sample_rate = audio["sample_rate"]
@@ -84,120 +160,78 @@ class SaveVideoFast:
             else:
                 wav_int16 = wav_int16.flatten()
 
-            channels = wav_np.shape[0]
-
             audio_temp = tempfile.NamedTemporaryFile(delete=False, suffix=".pcm")
             audio_temp.write(wav_int16.tobytes())
             audio_temp.close()
 
-            audio_input_spec = {
-                "path": audio_temp.name,
-                "sample_rate": sample_rate,
-                "channels": channels,
-            }
-
-        # ---------- 4. Build ffmpeg command ----------
-        cmd = ["ffmpeg", "-y", "-loglevel", "quiet"]
-
-        cmd += [
-            "-f", "rawvideo",
-            "-pix_fmt", "rgb24",
-            "-s", f"{W}x{H}",
-            "-r", str(frame_rate),
-            "-i", "pipe:0"
-        ]
-
-        if audio_input_spec is not None:
             cmd += [
                 "-f", "s16le",
-                "-ar", str(audio_input_spec["sample_rate"]),
-                "-ac", str(audio_input_spec["channels"]),
-                "-i", audio_input_spec["path"]
+                "-ar", str(sample_rate),
+                "-ac", str(wav_np.shape[0]),
+                "-i", audio_temp.name,
+                "-map", "0:v", "-map", "1:a", "-c:a", "aac",
             ]
-            cmd += ["-map", "0:v", "-map", "1:a", "-c:a", "aac"]
         else:
             cmd += ["-map", "0:v"]
 
-        if codec == "h264_nvenc":
-            cmd += [
-                "-c:v", "h264_nvenc",
-                "-preset", preset,
-                "-cq", str(video_quality),
-                "-movflags", "+faststart"
-            ]
-        else:
-            cmd += [
-                "-c:v", "libx264",
-                "-crf", str(video_quality),
-                "-movflags", "+faststart"
-            ]
+        cmd += cls._encoder_args(codec, preset, quality)
+        cmd += cls._metadata_args(metadata)
+        cmd += ["-movflags", "+faststart+use_metadata_tags", "-pix_fmt", "yuv420p", out_path]
 
-        cmd += ["-pix_fmt", "yuv420p", out_path]
-
-        # ---------- 5. Spawn ffmpeg & stream frames ----------
-        proc = subprocess.Popen(
-            cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL
-        )
-
-        # --- Batch conversion and write (optimised) ---
+        stderr_file = tempfile.TemporaryFile()
         try:
-            # Convert to uint8 on GPU if needed, then transfer to CPU
-            if frames.is_cuda:
-                if frames.dtype == torch.uint8:
-                    frames_cpu = frames.cpu(non_blocking=True)
-                else:
-                    frames_uint8 = (frames * 255).byte().contiguous()
-                    frames_cpu = frames_uint8.cpu(non_blocking=True)
-                torch.cuda.synchronize()
-            else:
-                if frames.dtype == torch.uint8:
-                    frames_cpu = frames.cpu()
-                else:
-                    frames_cpu = (frames * 255).byte().contiguous().cpu()
-
-            frames_np = frames_cpu.numpy()
-            if frames_np.shape[-1] == 4:
-                frames_np = frames_np[:, :, :, :3]
-            frames_np = np.ascontiguousarray(frames_np)
-            data = frames_np.tobytes()
-
-            # Write in chunks to avoid pipe limits (512 MB)
-            CHUNK_SIZE = 512 * 1024 * 1024
-            total_bytes = len(data)
-            written = 0
-            while written < total_bytes:
-                chunk = data[written:written + CHUNK_SIZE]
-                proc.stdin.write(chunk)
-                written += len(chunk)
-            proc.stdin.close()
-        except BrokenPipeError:
-            pass
-
-        # Wait for ffmpeg to finish
-        stdout, stderr = proc.communicate()
-        if proc.returncode != 0:
-            print(f"[SaveVideoFast] ffmpeg error:\n{stderr.decode()}")
-            raise RuntimeError(f"ffmpeg failed: {stderr.decode()}")
-
-        # ---------- 6. Clean up audio temp file ----------
-        if audio_temp is not None:
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=stderr_file,
+            )
+            stdin = proc.stdin
+            assert stdin is not None
             try:
-                os.unlink(audio_temp.name)
-            except OSError:
-                pass
+                if frames.is_cuda:
+                    if frames.dtype == torch.uint8:
+                        frames_cpu = frames.cpu(non_blocking=True)
+                    else:
+                        frames_cpu = (frames * 255).byte().contiguous().cpu(non_blocking=True)
+                    torch.cuda.synchronize()
+                else:
+                    if frames.dtype == torch.uint8:
+                        frames_cpu = frames.cpu()
+                    else:
+                        frames_cpu = (frames * 255).byte().contiguous().cpu()
 
-        # ---------- 7. Build UI preview ----------
-        return {
-            "ui": {
-                "video": [
-                    {
-                        "filename": out_filename,
-                        "subfolder": "",
-                        "type": "output"
-                    }
-                ]
-            }
-        }
+                frames_np = frames_cpu.numpy()
+                if frames_np.shape[-1] == 4:
+                    frames_np = frames_np[:, :, :, :3]
+                frames_np = np.ascontiguousarray(frames_np)
+                data = frames_np.tobytes()
+
+                CHUNK_SIZE = 512 * 1024 * 1024
+                total_bytes = len(data)
+                written = 0
+                while written < total_bytes:
+                    chunk = data[written:written + CHUNK_SIZE]
+                    stdin.write(chunk)
+                    written += len(chunk)
+            except BrokenPipeError:
+                pass
+            finally:
+                try:
+                    stdin.close()
+                except OSError:
+                    pass
+
+            proc.wait()
+            stderr_file.seek(0)
+            stderr = stderr_file.read()
+        finally:
+            stderr_file.close()
+            if audio_temp is not None:
+                try:
+                    os.unlink(audio_temp.name)
+                except OSError:
+                    pass
+
+        if proc.returncode != 0:
+            raise RuntimeError(f"[SaveVideoFast] ffmpeg failed:\n{stderr.decode(errors='replace')}")
